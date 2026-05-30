@@ -28,7 +28,10 @@ import {
   ShieldCheck,
   Send,
   Sparkles,
-  Info
+  Info,
+  Activity,
+  Signal,
+  AlertTriangle
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { ActiveTransfer, Peer, DeviceType, WSMessage } from "./types";
@@ -47,6 +50,11 @@ const WEBRTC_SETUP_TIMEOUT = 5000; // 5s timeout to trigger WebSocket fallback
 export default function App() {
   // Connection states
   const [socketConnected, setSocketConnected] = useState(false);
+  const [latency, setLatency] = useState<number | null>(null);
+  const [hasConnectedOnce, setHasConnectedOnce] = useState(false);
+  const [dismissedAlert, setDismissedAlert] = useState<string | null>(null);
+  const [connectionError, setConnectionError] = useState(false);
+  const [isVercel] = useState(() => typeof window !== "undefined" && window.location.hostname.includes("vercel.app"));
   const [self, setSelf] = useState<Peer | null>(null);
   const [peers, setPeers] = useState<Peer[]>([]);
   const [roomCode, setRoomCode] = useState("");
@@ -77,6 +85,7 @@ export default function App() {
 
   // Connection refs
   const wsRef = useRef<WebSocket | null>(null);
+  const pingSentTimeRef = useRef<number | null>(null);
   const pcRefs = useRef<{ [txId: string]: RTCPeerConnection }>({});
   const dcRefs = useRef<{ [txId: string]: RTCDataChannel }>({});
   const fileRefs = useRef<{ [txId: string]: File }>({});
@@ -135,14 +144,29 @@ export default function App() {
       const socket = new WebSocket(wsUrl);
       wsRef.current = socket;
 
+      const connectTimeout = setTimeout(() => {
+        if (socket.readyState !== WebSocket.OPEN) {
+          setConnectionError(true);
+        }
+      }, 3500);
+
       socket.onopen = () => {
+        clearTimeout(connectTimeout);
         setSocketConnected(true);
+        setHasConnectedOnce(true);
+        setConnectionError(false);
+        // Instant first ping to calculate latency
+        pingSentTimeRef.current = performance.now();
+        socket.send(JSON.stringify({ type: "heartbeat" }));
       };
 
       socket.onclose = () => {
+        clearTimeout(connectTimeout);
         setSocketConnected(false);
         setSelf(null);
         setPeers([]);
+        setLatency(null); // Offline resets latency value
+        setConnectionError(true);
         // Trigger auto reconnect
         setTimeout(initWS, 3000);
       };
@@ -241,9 +265,14 @@ export default function App() {
               break;
             }
 
-            case "heartbeat":
-              // Heartbeat verified
+            case "heartbeat": {
+              if (pingSentTimeRef.current !== null) {
+                const rtt = Math.round(performance.now() - pingSentTimeRef.current);
+                setLatency(rtt);
+                pingSentTimeRef.current = null;
+              }
               break;
+            }
           }
         } catch (error) {
           console.error("Critical failure during client packet parse:", error);
@@ -253,18 +282,26 @@ export default function App() {
 
     initWS();
 
-    // Setup active websocket heartbeat to stay open on Cloud Run paths
+    // Setup active websocket heartbeat to stay open on Cloud Run paths and monitor latency
     const keepalive = setInterval(() => {
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        pingSentTimeRef.current = performance.now();
         wsRef.current.send(JSON.stringify({ type: "heartbeat" }));
       }
-    }, 25000);
+    }, 3000);
 
     return () => {
       clearInterval(keepalive);
       if (wsRef.current) wsRef.current.close();
     };
   }, []);
+
+  // Reset dismissed latency warning alert once connection quality recovers
+  useEffect(() => {
+    if (latency !== null && latency < 150) {
+      setDismissedAlert(null);
+    }
+  }, [latency]);
 
   // Update room URL query params when roomCode changes
   useEffect(() => {
@@ -997,7 +1034,7 @@ export default function App() {
     }
   };
 
-  // Select target device popup confirmation (multiple devices flow)
+  // Selector target device popup confirmation (multiple devices flow)
   const handleSelectPeerFromModal = (pId: string) => {
     if (selectedFileForPrompt) {
       startTransferProcess(pId, selectedFileForPrompt);
@@ -1005,6 +1042,52 @@ export default function App() {
     setSelectedFileForPrompt(null);
     setShowTargetSelectModal(false);
   };
+
+  // Determine dynamic latency state Tier
+  const getLatencyTier = () => {
+    if (!socketConnected) return "offline";
+    if (latency === null) return "measuring";
+    if (latency < 100) return "excellent";
+    if (latency < 250) return "good";
+    if (latency < 500) return "unstable";
+    return "critical";
+  };
+
+  const latencyTier = getLatencyTier();
+
+  let latencyColorDot = "bg-rose-500 animate-pulse";
+  let latencyStatusText = "Searching Network...";
+  let latencyIconBgColor = "text-rose-500 animate-pulse";
+  let latencyTextShort = "Offline";
+
+  if (socketConnected) {
+    if (latencyTier === "measuring") {
+      latencyColorDot = "bg-purple-400 animate-pulse";
+      latencyStatusText = "Network Syncing...";
+      latencyIconBgColor = "text-purple-400 animate-pulse";
+      latencyTextShort = "Syncing...";
+    } else if (latencyTier === "excellent") {
+      latencyColorDot = "bg-emerald-400 shadow-[0_0_8px_#34d399] animate-pulse";
+      latencyStatusText = "Excellent Ping";
+      latencyIconBgColor = "text-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.3)]";
+      latencyTextShort = "Excellent";
+    } else if (latencyTier === "good") {
+      latencyColorDot = "bg-purple-400 shadow-[0_0_8px_#a78bfa]";
+      latencyStatusText = "Good Ping";
+      latencyIconBgColor = "text-purple-400";
+      latencyTextShort = "Good";
+    } else if (latencyTier === "unstable") {
+      latencyColorDot = "bg-amber-400 shadow-[0_0_8px_#fbbf24] animate-pulse";
+      latencyStatusText = "Unstable Ping";
+      latencyIconBgColor = "text-amber-400 shadow-[0_0_8px_rgba(245,158,11,0.4)]";
+      latencyTextShort = "Unstable";
+    } else if (latencyTier === "critical") {
+      latencyColorDot = "bg-rose-500 shadow-[0_0_10px_#f43f5e] animate-pulse";
+      latencyStatusText = "High Network Latency";
+      latencyIconBgColor = "text-rose-500 shadow-[0_0_10px_rgba(244,63,94,0.4)] animate-pulse";
+      latencyTextShort = "Poor";
+    }
+  }
 
   return (
     <div
@@ -1073,9 +1156,12 @@ export default function App() {
                 Local Share
               </h1>
               <div className="flex items-center gap-1.5 mt-1">
-                <span className={`w-1.5 h-1.5 rounded-full ${socketConnected ? "bg-[#ec4899] animate-pulse shadow-[0_0_8px_#ec4899]" : "bg-rose-500"}`} />
-                <span className="text-[10px] text-purple-300/70 uppercase tracking-widest font-mono">
-                  {socketConnected ? "Local Network Discovery Active" : "Searching Network..."}
+                <span className={`w-1.5 h-1.5 rounded-full ${latencyColorDot}`} />
+                <span className="text-[10px] text-purple-300/70 uppercase tracking-widest font-mono flex items-center gap-1">
+                  <span>{latencyStatusText}</span>
+                  {socketConnected && latency !== null && (
+                    <span className="text-purple-400/50 normal-case font-normal text-[9px]">({latency}ms RTT)</span>
+                  )}
                 </span>
               </div>
             </div>
@@ -1084,6 +1170,22 @@ export default function App() {
           {/* Network Settings & Quick Actions */}
           <div className="flex flex-wrap items-center gap-3">
             
+            {/* Real-time Network Latency Badge */}
+            <div className="bg-[#120824]/65 border border-purple-900/20 rounded-xl px-3.5 py-1.5 flex items-center gap-2.5">
+              <div className={`p-1.5 bg-[#070313] rounded-lg ${latencyIconBgColor}`}>
+                <Activity className="w-3.5 h-3.5" />
+              </div>
+              <div className="text-left">
+                <div className="text-[10px] text-purple-300/40 uppercase tracking-widest font-mono leading-none">Net Health</div>
+                <div className="text-xs font-mono font-medium text-purple-200 flex items-center gap-1">
+                  <span>{latencyTextShort}</span>
+                  {socketConnected && latency !== null && (
+                    <span className="text-[10px] text-purple-400 font-normal">({latency}ms)</span>
+                  )}
+                </div>
+              </div>
+            </div>
+
             {/* Quick stats network room */}
             <div className="bg-[#120824]/65 border border-purple-900/20 rounded-xl px-3.5 py-1.5 flex items-center gap-2.5">
               <div className="p-1.5 bg-[#070313] rounded-lg text-[#ec4899]">
@@ -1135,6 +1237,91 @@ export default function App() {
         </div>
       </header>
 
+      {/* FLOATING TOP ALERTS FOR NETWORK INSTABILITY OR OFFLINE */}
+      <AnimatePresence>
+        {((!socketConnected && (hasConnectedOnce || connectionError)) || 
+          (socketConnected && (latencyTier === "unstable" || latencyTier === "critical") && dismissedAlert !== latencyTier)) && (
+          <motion.div
+            initial={{ opacity: 0, y: -50, x: "-50%", scale: 0.95 }}
+            animate={{ opacity: 1, y: 0, x: "-50%", scale: 1 }}
+            exit={{ opacity: 0, y: -30, x: "-50%", scale: 0.95 }}
+            className="fixed top-24 left-1/2 z-50 w-[95%] max-w-md"
+          >
+            <div className={`p-4 rounded-2xl backdrop-blur-lg flex items-start gap-3 shadow-2xl border ${
+              !socketConnected 
+                ? isVercel
+                  ? "bg-purple-950/85 border-purple-500/30 shadow-purple-950/30"
+                  : "bg-rose-950/80 border-rose-500/30 shadow-rose-950/20" 
+                : latencyTier === "unstable"
+                  ? "bg-amber-950/80 border-amber-500/30 shadow-amber-950/15"
+                  : "bg-red-950/80 border-red-500/30 shadow-red-950/20"
+            }`}>
+              
+              <div className="mt-0.5">
+                {!socketConnected ? (
+                  isVercel ? (
+                    <AlertCircle className="w-5 h-5 text-purple-400 animate-pulse" />
+                  ) : (
+                    <WifiOff className="w-5 h-5 text-rose-400 animate-pulse" />
+                  )
+                ) : latencyTier === "unstable" ? (
+                  <AlertTriangle className="w-5 h-5 text-amber-400 animate-pulse" />
+                ) : (
+                  <AlertCircle className="w-5 h-5 text-red-500 animate-pulse" />
+                )}
+              </div>
+
+              <div className="flex-1 text-left">
+                <h4 className={`text-xs font-bold leading-normal ${
+                  !socketConnected 
+                    ? isVercel 
+                      ? "text-purple-200"
+                      : "text-rose-200" 
+                    : latencyTier === "unstable"
+                      ? "text-amber-200"
+                      : "text-red-200"
+                }`}>
+                  {!socketConnected 
+                    ? isVercel
+                      ? "Vercel / Serverless Deployment Notice"
+                      : "Connection Interrupted" 
+                    : latencyTier === "unstable"
+                      ? "Network Latency Warning"
+                      : "Severe Network Latency Detected"}
+                </h4>
+                
+                <p className="text-[11px] text-purple-200/80 mt-1 leading-relaxed">
+                  {!socketConnected 
+                    ? isVercel
+                      ? "Vercel is a stateless serverless architecture. Express WebSockets require a stateful, continuous Node.js runtime process to keep active handshake channels open and coordinate network discovery. To communicate across devices, deploy this application to a persistent hosting platform like Google Cloud Run, Render, Railway, or Fly.io."
+                      : "Your connection to the dynamic share channel was lost. Trying to reconnect automatically..." 
+                    : latencyTier === "unstable"
+                      ? `Your connection latency is moderate (${latency}ms). Signaling or transfers over symmetric gateway fallback may feel slightly laggy.`
+                      : `Highly congested connection (${latency}ms) detected. This will likely cause signaling time outs or peer handshake failures.`}
+                </p>
+              </div>
+
+              {((!socketConnected && isVercel) || socketConnected) && (
+                <button
+                  onClick={() => {
+                    if (!socketConnected) {
+                      setConnectionError(false);
+                    } else {
+                      setDismissedAlert(latencyTier);
+                    }
+                  }}
+                  className="p-1 hover:bg-white/10 rounded-lg text-purple-300 hover:text-white transition-colors cursor-pointer"
+                  title="Dismiss alert"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              )}
+
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       <AnimatePresence>
         {showRoomSettings && (
           <motion.div
@@ -1157,7 +1344,7 @@ export default function App() {
                 </div>
                 
                 <p className="text-xs text-purple-300/70 leading-relaxed">
-                  By default, everyone on your Wi-Fi or Local network automatically joins the same discovery group. Enter a customized Space ID below to partition and create a private file sharing room.
+                  By default, everyone on your Wi-Fi, LAN, or local subnet dynamically auto-groups into the same space. Enter a customized Space ID below to partition and create a private file sharing room.
                 </p>
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">

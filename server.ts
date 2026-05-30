@@ -6,6 +6,7 @@
 import express from "express";
 import http from "http";
 import path from "path";
+import os from "os";
 import { WebSocketServer, WebSocket } from "ws";
 import { createServer as createViteServer } from "vite";
 import { DeviceType, Peer, WSMessage } from "./src/types";
@@ -62,6 +63,58 @@ function obfuscateIp(ip: string): string {
   return "Local Network";
 }
 
+// Robust fallback to locate server host's primary physical network card IPv4 address
+function getLocalInterfaceIp(): string {
+  try {
+    const interfaces = os.networkInterfaces();
+    for (const devName in interfaces) {
+      const iface = interfaces[devName];
+      if (iface) {
+        for (const alias of iface) {
+          if (alias.family === "IPv4" && !alias.internal) {
+            return alias.address;
+          }
+        }
+      }
+    }
+  } catch (e) {
+    console.error("Failed to query host network interfaces:", e);
+  }
+  return "127.0.0.1";
+}
+
+// Standardizes IP addresses to Class C (/24) for IPv4 or /64 prefixes for IPv6
+function getSubnetGroupCode(ip: string): string {
+  let clean = ip.replace(/^::ffff:/, "");
+  if (clean === "::1" || clean === "127.0.0.1" || clean.toLowerCase() === "localhost") {
+    // Under local development or manual host triggers, query the host's actual LAN interface card
+    // This connects localhost screens to the same room code as and local Wi-Fi phones
+    clean = getLocalInterfaceIp();
+  }
+
+  if (clean === "::1" || clean === "127.0.0.1" || clean.toLowerCase() === "localhost") {
+    return "local-sandbox";
+  }
+
+  // IPv4 CIDR /24 (group by Class C subnet)
+  if (clean.includes(".")) {
+    const parts = clean.split(".");
+    if (parts.length === 4) {
+      return `net-${parts[0]}-${parts[1]}-${parts[2]}`;
+    }
+  }
+
+  // IPv6 Grouping (first 3/4 blocks)
+  if (clean.includes(":")) {
+    const parts = clean.split(":");
+    const blocksCount = Math.min(3, parts.length);
+    const prefix = parts.slice(0, blocksCount).join("-").replace(/[^a-zA-Z0-9]/g, "-");
+    return `net-v6-${prefix}`;
+  }
+
+  return "local-sandbox";
+}
+
 interface ConnectedPeer {
   id: string;
   name: string;
@@ -108,9 +161,8 @@ async function startServer() {
     if (clientIp === "::1") clientIp = "127.0.0.1";
 
     const displayIp = obfuscateIp(clientIp);
-    // Create automatic network-based room code
-    const ipClean = clientIp.replace(/[^a-zA-Z0-9]/g, "-");
-    const networkRoomCode = clientIp === "127.0.0.1" ? "local-sandbox" : `net-${ipClean}`;
+    // Create automatic network-based room code using Class C / subnet grouping
+    const networkRoomCode = getSubnetGroupCode(clientIp);
 
     res.json({
       clientIp,
@@ -173,8 +225,7 @@ async function startServer() {
     const rawIp = resolveSocketIp(req);
     const clientIp = rawIp.replace(/^::ffff:/, "");
     const displayIp = obfuscateIp(clientIp);
-    const ipClean = clientIp === "::1" || clientIp === "127.0.0.1" ? "local-sandbox" : clientIp.replace(/[^a-zA-Z0-9]/g, "-");
-    const defaultRoomCode = clientIp === "::1" || clientIp === "127.0.0.1" ? "local-sandbox" : `net-${ipClean}`;
+    const defaultRoomCode = getSubnetGroupCode(clientIp);
 
     const peerId = `p-${Math.random().toString(36).substring(2, 11)}`;
     const peerName = generateRandomName();
