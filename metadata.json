@@ -1,0 +1,6 @@
+{
+  "name": "Local File Share",
+  "description": "A browser-based file-sharing system on local networks. Discover nearby devices and share files instantly and securely over P2P WebRTC or local WebSocket relay.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
